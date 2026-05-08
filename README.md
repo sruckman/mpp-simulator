@@ -6,7 +6,7 @@ Built for teaching how crossing design, pool size, sequencing coverage, and gene
 
 ---
 
-## Run it in your browser (no R needed)
+## Run it in your browser
 
 👉 **https://sruckman.shinyapps.io/mpp_simulator/**
 
@@ -42,6 +42,4 @@ shiny::runGitHub("mpp-simulator", "sruckman")
 |------|-----------------|
 | Founder haplotypes | The pure building blocks before any recombination |
 | RIL mosaic | How founders are mixed after recombination |
-| Cases vs. controls | At a QTL peak, one founder color dominates in cases; controls look random |
-| QTL scan | LOD score across the chromosome; red dashed line = Bonferroni threshold (LOD 3.3) |
-| Founder frequency difference | Which founders are enriched in cases vs. controls at each position |
+| Cases vs. controls | At a QTL peak, one founder color dominates in cases; controls look ran
