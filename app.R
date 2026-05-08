@@ -1,26 +1,21 @@
 library(shiny)
 library(ggplot2)
+library(viridis)
+
+# Chromosome positions: 0 to 100 cM in 0.5 cM steps = 202 positions
+POS_SEQ <- seq(0, 100, length.out = 202L)
+N_POS   <- length(POS_SEQ)
 
 # ============================================================
 # SIMULATION FUNCTIONS
 # ============================================================
 
 get_founder_colors <- function(n) {
-  base_pal <- c(
-    "#3A86FF", "#FF006E", "#FB5607", "#FFBE0B",
-    "#8338EC", "#06D6A0", "#118AB2", "#6D4C41"
-  )
-  if (n <= 8) return(base_pal[seq_len(n)])
-  colorRampPalette(c(
-    "#3A86FF", "#FF006E", "#FB5607", "#FFBE0B",
-    "#8338EC", "#06D6A0", "#118AB2", "#6D4C41"
-  ))(n)
+  viridis(n, option = "turbo", begin = 0.05, end = 0.95)
 }
 
 simulate_rils <- function(n_founders, n_gen, n_total, design) {
-  n_pos   <- 101L
-  pos_seq <- 0L:100L
-  haps    <- matrix(1L, nrow = n_total, ncol = n_pos)
+  haps <- matrix(1L, nrow = n_total, ncol = N_POS)
 
   for (r in seq_len(n_total)) {
     if (design == "hub") {
@@ -31,20 +26,16 @@ simulate_rils <- function(n_founders, n_gen, n_total, design) {
       pool <- seq_len(n_founders)
     }
 
-    # Start with one randomly chosen founder
-    state <- rep(sample(pool, 1L), n_pos)
+    state <- rep(sample(pool, 1L), N_POS)
 
-    # Accumulate all crossovers across n_gen generations at once.
-    # Each generation contributes ~1 crossover per 100 cM (Poisson rate = 1).
-    # More generations = more breakpoints = smaller blocks.
-    total_cross <- rpois(1L, n_gen)
+    total_cross <- rpois(1L, n_gen * 0.25)
     if (total_cross > 0L) {
       cpts <- sort(runif(total_cross, 0, 100))
       for (cp in cpts) {
-        idx <- which(pos_seq >= cp)[1L]
-        if (is.na(idx) || idx > n_pos) next
+        idx <- which(POS_SEQ >= cp)[1L]
+        if (is.na(idx) || idx > N_POS) next
         new_f            <- sample(pool, 1L)
-        state[idx:n_pos] <- new_f
+        state[idx:N_POS] <- new_f
       }
     }
 
@@ -53,26 +44,6 @@ simulate_rils <- function(n_founders, n_gen, n_total, design) {
   haps
 }
 
-add_noise <- function(haps, n_founders, coverage, haplo_acc) {
-  # Coverage drives read depth: below ~5x things are very noisy, above ~15x nearly perfect.
-  # Higher coverage amplifies QTL signal by reducing haplotype misassignment.
-  cov_err <- exp(-coverage / 4)   # steep dropoff: 1x~0.78, 5x~0.29, 15x~0.02
-
-  # Block-level error: a whole inferred block gets assigned to the wrong founder.
-  # This matches real haplotype inference errors (segment-level, not position-level).
-  block_err_rate <- min(0.6, max(0, (1 - haplo_acc) * 0.4 + cov_err * 0.3))
-
-  for (r in seq_len(nrow(haps))) {
-    breaks <- c(1L, which(diff(haps[r, ]) != 0L) + 1L, ncol(haps) + 1L)
-    for (b in seq_len(length(breaks) - 1L)) {
-      if (runif(1L) < block_err_rate) {
-        wrong_f <- sample.int(n_founders, 1L)
-        haps[r, breaks[b]:(breaks[b + 1L] - 1L)] <- wrong_f
-      }
-    }
-  }
-  haps
-}
 
 get_qtl_config <- function(model, n_founders) {
   set.seed(42L)
@@ -105,31 +76,44 @@ get_qtl_config <- function(model, n_founders) {
 simulate_phenotype <- function(true_haps, qtl_cfg) {
   pheno <- rnorm(nrow(true_haps), 0, 1)
   for (i in seq_along(qtl_cfg$pos)) {
-    col_idx <- qtl_cfg$pos[i] + 1L
+    col_idx <- which.min(abs(POS_SEQ - qtl_cfg$pos[i]))
     pheno   <- pheno + qtl_cfg$eff[[i]][true_haps[, col_idx]]
   }
   pheno
 }
 
-# Chi-square test (2N allele counts per pool: each inbred RIL is diploid/
-# homozygous so contributes 2 identical alleles per position).
-# Chi-square gives exact p-values with no Monte Carlo LOD cap.
-qtl_scan <- function(obs_haps, case_idx, control_idx) {
-  n_pos <- ncol(obs_haps)
-  lod   <- numeric(n_pos)
-  all_lvls <- seq_len(max(obs_haps))
+# Chi-square test on 2 x k founder count table (cases vs controls).
+# Coverage models read-depth sampling: instead of observing all 2N true allele
+# counts, we draw (coverage x pool_size) reads from the pool proportional to
+# true founder frequencies. High coverage -> observed ~ true -> strong LOD.
+# Low coverage -> noisy sample -> weak LOD.
+qtl_scan <- function(obs_haps, case_idx, control_idx, coverage) {
+  n_pos      <- ncol(obs_haps)
+  lod        <- numeric(n_pos)
+  n_reads    <- round(coverage * length(case_idx))
+
   for (p in seq_len(n_pos)) {
     case_f <- obs_haps[case_idx,    p]
     ctrl_f <- obs_haps[control_idx, p]
     lvls   <- sort(unique(c(case_f, ctrl_f)))
     if (length(lvls) < 2L) next
-    # Multiply by 2: diploid individuals contribute 2 alleles each
-    tab <- rbind(
-      2L * table(factor(case_f, levels = lvls)),
-      2L * table(factor(ctrl_f, levels = lvls))
-    )
+
+    true_case <- as.numeric(2L * table(factor(case_f, levels = lvls)))
+    true_ctrl <- as.numeric(2L * table(factor(ctrl_f, levels = lvls)))
+
+    # Coverage = accuracy of frequency measurement, not sample size.
+    # Sample reads from the pool at the given coverage depth,
+    # then normalize back to pool-size scale so LOD reflects
+    # pool size (biology/design) not read depth (technical).
+    obs_case <- as.numeric(rmultinom(1L, n_reads, prob = true_case / sum(true_case)))
+    obs_ctrl <- as.numeric(rmultinom(1L, n_reads, prob = true_ctrl / sum(true_ctrl)))
+
+    norm_case <- obs_case / sum(obs_case) * sum(true_case)
+    norm_ctrl <- obs_ctrl / sum(obs_ctrl) * sum(true_ctrl)
+
+    tab <- rbind(norm_case, norm_ctrl)
     tryCatch({
-      pv <- chisq.test(tab, correct = FALSE)$p.value
+      pv <- suppressWarnings(chisq.test(tab, correct = FALSE)$p.value)
       if (!is.na(pv) && pv > 0) lod[p] <- -log10(pv)
     }, error = function(e) NULL)
   }
@@ -163,7 +147,7 @@ ui <- fluidPage(
       sliderInput("n_founders", "Founders",
                   min=2, max=500, value=8, step=1, width="100%"),
       sliderInput("n_gen", "Generations of recombination",
-                  min=1, max=50, value=10, step=1, width="100%"),
+                  min=1, max=50, value=5, step=1, width="100%"),
 
       hr(),
       h4("Pool"),
@@ -174,11 +158,10 @@ ui <- fluidPage(
                   min=5, max=100, value=50, step=5, width="100%"),
 
       hr(),
-      h4("Sequencing Quality"),
+      h4("Sequencing Coverage"),
+      p(tags$small("Reads per individual. Higher coverage = less sampling noise = stronger LOD.")),
       sliderInput("coverage", "Coverage (x)",
-                  min=0.5, max=30, value=10, step=0.5, width="100%"),
-      sliderInput("haplo_acc", "Haplotype inference accuracy",
-                  min=0, max=1, value=0.95, step=0.05, width="100%"),
+                  min=1, max=100, value=30, step=1, width="100%"),
 
       hr(),
       h4("Genetic Model"),
@@ -192,9 +175,9 @@ ui <- fluidPage(
 
       hr(),
       h4("Significance Threshold"),
-      p(tags$small("Bonferroni (101 tests, α=0.05) ≈ LOD 3.3")),
+      p(tags$small("Bonferroni (202 tests, α=0.05) ≈ LOD 3.6")),
       sliderInput("lod_thresh", "LOD threshold",
-                  min=1, max=8, value=3.3, step=0.1, width="100%"),
+                  min=1, max=8, value=3.6, step=0.1, width="100%"),
 
       br(),
       actionButton("simulate", "Simulate",
@@ -225,7 +208,7 @@ ui <- fluidPage(
 
       h4("QTL Scan"),
       p(tags$small(
-        "Chi-square test (2N diploid allele counts per pool) at each of 101 positions. ",
+        "Fisher's exact test (2N diploid allele counts per pool) at each of 202 positions (0.5 cM steps). Assumes perfect haplotype inference. ",
         tags$span(style="color:#1a7a1a; font-weight:bold;", "Green lines"),
         " = true QTL positions. ",
         tags$span(style="color:red;", "Red dashed"),
@@ -257,13 +240,11 @@ server <- function(input, output, session) {
     n_total   <- 3L * input$pool_size
     n_display <- min(input$n_display, input$pool_size)
 
-    true_haps    <- simulate_rils(input$n_founders, input$n_gen, n_total, input$design)
-    obs_haps     <- add_noise(true_haps, input$n_founders,
-                              input$coverage, input$haplo_acc)
+    obs_haps     <- simulate_rils(input$n_founders, input$n_gen, n_total, input$design)
     qtl_cfg      <- get_qtl_config(input$genetic_model, input$n_founders)
-    pheno        <- simulate_phenotype(true_haps, qtl_cfg)
-    founder_haps <- matrix(rep(seq_len(input$n_founders), each = 101L),
-                           nrow = input$n_founders, ncol = 101L)
+    pheno        <- simulate_phenotype(obs_haps, qtl_cfg)
+    founder_haps <- matrix(rep(seq_len(input$n_founders), each = N_POS),
+                           nrow = input$n_founders, ncol = N_POS)
 
     # Cases = top N by phenotype (selected pool)
     # Controls = random N from the remaining 2N unselected individuals
@@ -273,9 +254,10 @@ server <- function(input, output, session) {
     control_idx <- sample(unselected, input$pool_size)
 
     # Fisher scan using full pools with 2N diploid allele counts
-    lod <- qtl_scan(obs_haps, case_idx, control_idx)
+    lod <- qtl_scan(obs_haps, case_idx, control_idx, input$coverage)
 
-    # Display subsets for mosaics (sorted by QTL position to pop out dominant founder)
+    # Display subsets for mosaics
+    disp_all  <- sample.int(n_total, min(input$n_display * 2L, n_total))
     disp_case <- case_idx[seq_len(n_display)]
     disp_ctrl <- control_idx[seq_len(n_display)]
 
@@ -290,6 +272,7 @@ server <- function(input, output, session) {
          lod_thresh   = input$lod_thresh,
          case_idx     = case_idx,
          control_idx  = control_idx,
+         disp_all     = disp_all,
          disp_case    = disp_case,
          disp_ctrl    = disp_ctrl)
   })
@@ -302,9 +285,9 @@ server <- function(input, output, session) {
     cols <- get_founder_colors(nf)
 
     df <- data.frame(
-      position = rep(0L:100L, each = nf),
-      founder  = rep(seq_len(nf), times = 101L),
-      fill_f   = factor(rep(seq_len(nf), times = 101L), levels = seq_len(nf))
+      position = rep(POS_SEQ, each = nf),
+      founder  = rep(seq_len(nf), times = N_POS),
+      fill_f   = factor(rep(seq_len(nf), times = N_POS), levels = seq_len(nf))
     )
 
     ggplot(df, aes(x = position, y = founder, fill = fill_f)) +
@@ -329,14 +312,13 @@ server <- function(input, output, session) {
     nf   <- r$n_founders
     cols <- get_founder_colors(nf)
 
-    # Show display sample: first n_display cases then first n_display controls
-    disp_idx <- c(r$disp_case, r$disp_ctrl)
-    disp_haps <- r$obs_haps[disp_idx, , drop = FALSE]
+    # Random sample from the full population — not split by case/control
+    disp_haps <- r$obs_haps[r$disp_all, , drop = FALSE]
     nd <- nrow(disp_haps)
 
     df <- data.frame(
-      position = rep(0L:100L, each = nd),
-      ril      = rep(seq_len(nd), times = 101L),
+      position = rep(POS_SEQ, each = nd),
+      ril      = rep(seq_len(nd), times = N_POS),
       founder  = factor(as.vector(disp_haps), levels = seq_len(nf))
     )
 
@@ -384,14 +366,14 @@ server <- function(input, output, session) {
     nk <- nrow(control_haps)
 
     df_cases <- data.frame(
-      position = rep(0L:100L, each = nc),
-      ril      = rep(seq_len(nc), times = 101L),
+      position = rep(POS_SEQ, each = nc),
+      ril      = rep(seq_len(nc), times = N_POS),
       founder  = factor(as.vector(case_haps), levels = seq_len(nf)),
       group    = "Cases"
     )
     df_ctrl <- data.frame(
-      position = rep(0L:100L, each = nk),
-      ril      = rep(seq_len(nk), times = 101L),
+      position = rep(POS_SEQ, each = nk),
+      ril      = rep(seq_len(nk), times = N_POS),
       founder  = factor(as.vector(control_haps), levels = seq_len(nf)),
       group    = "Controls"
     )
@@ -427,7 +409,7 @@ server <- function(input, output, session) {
   output$lod_plot <- renderPlot({
     req(results())
     r      <- results()
-    lod_df <- data.frame(position = 0L:100L, lod = r$lod)
+    lod_df <- data.frame(position = POS_SEQ, lod = r$lod)
     y_max  <- max(r$lod_thresh * 1.5, max(r$lod) * 1.15, na.rm = TRUE)
 
     p <- ggplot(lod_df, aes(x = position, y = lod)) +
@@ -453,8 +435,8 @@ server <- function(input, output, session) {
     nf   <- r$n_founders
     cols <- get_founder_colors(nf)
 
-    pos_seq      <- 0L:100L
-    n_pos        <- length(pos_seq)
+    pos_seq      <- POS_SEQ
+    n_pos        <- N_POS
     nc           <- length(r$case_idx)
     nk           <- length(r$control_idx)
     case_haps    <- r$obs_haps[r$case_idx,    , drop = FALSE]
