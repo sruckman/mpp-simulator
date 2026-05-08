@@ -6,9 +6,9 @@ Built for teaching how crossing design, pool size, sequencing coverage, and gene
 
 ---
 
-## Run it in your browser (no R needed)
+## Run it in your browser
 
-👉 **[https://sruckman.shinyapps.io/genetics_primer/](https://sruckman.shinyapps.io/genetics_primer/)**
+**[https://sruckman.shinyapps.io/genetics_primer/](https://sruckman.shinyapps.io/genetics_primer/)**
 
 ---
 
