@@ -8,7 +8,7 @@ Built for teaching how crossing design, pool size, sequencing coverage, and gene
 
 ## Run it in your browser (no R needed)
 
-👉 **https://sruckman.shinyapps.io/Genetics-Primer/**
+👉 **https://sruckman.shinyapps.io/mpp_simulator/**
 
 ---
 
